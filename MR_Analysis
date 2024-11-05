@@ -1,0 +1,32 @@
+### MR 
+
+## Load in the Lactase data
+exp_dat <- fread()
+exp_dat <- TwoSampleMR::format_data(exp_dat, type = "exposure", 
+                                    chr_col = "CHROM", 
+                                    pos_col = "GENPOS", snp_col = "RSID", 
+                                    beta_col = "BETA",se_col = "SE", pval_col = "LOG10P", log_pval = T,
+                                    eaf_col = "A1FREQ",effect_allele_col = "A1",other_allele_col = "A0")
+
+
+### Load in cancer GWAS
+rm(outcome_dat)
+outcome_dat <- read_outcome_data(
+  filename = ,
+  sep = "\t",
+  snp_col = "SNP",
+  beta_col = "Beta",
+  se_col = "SE",
+  effect_allele_col = "A1",
+  other_allele_col = "A0",
+  pval_col = "PVALUE",
+  eaf_col =  "EAF"
+)
+
+
+### harmonise exposure and outcome data
+harm_dat <- harmonise_data(exp_dat,outcome_dat)
+
+### Run MR
+Res <- harm_dat %>%
+  mr_singlesnp(.) %>% dplyr::select(exposure, outcome, SNP, b, se, p) %>% rename(method = SNP) %>% filter(!method == "All - MR Egger") 
