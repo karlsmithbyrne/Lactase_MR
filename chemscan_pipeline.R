@@ -30,7 +30,8 @@ library(Biostrings)
 .TILE_STEP      <- .TILE_LENGTH - .TILE_OVERLAP  # 48
 .CTD_URL        <- "https://ctdbase.org/reports/CTD_chem_gene_ixns.tsv.gz"
 .UNIPROT_REST   <- "https://rest.uniprot.org"
-.IEDB_REST      <- "https://query-api.iedb.org/epitope_search"
+.IEDB_EPITOPE   <- "https://query-api.iedb.org/epitope_search"
+.IEDB_BCELL     <- "https://query-api.iedb.org/bcell_search"
 .HPA_API        <- "https://www.proteinatlas.org/api/search_download.php"
 
 # Kyte-Doolittle hydropathy values (higher = more hydrophobic)
@@ -304,6 +305,10 @@ map_genes_to_uniprot <- function(genes, cache = NULL) {
 #' Query IEDB for linear B-cell epitopes from human proteins bearing chemical
 #' modifications.
 #'
+#' Uses the IEDB IQ-API (PostgREST-based) with two search strategies:
+#' 1. epitope_search: filter by modification description text
+#' 2. bcell_search: retrieve assay-level detail (isotype, qualitative measure)
+#'
 #' @param cache Optional cachem cache.
 #' @return A tibble with columns: EpitopeID, Sequence, ModifiedPositions,
 #'   UniProtID, AssayType, AntibodyIsotype, PubMedIDs, HighConfidenceIgG.
@@ -316,26 +321,43 @@ fetch_iedb_modified_epitopes <- function(cache = NULL) {
     "phospho", "malondialdehyde", "adduct", "hapten"
   )
 
-  fetch_for_term <- function(term) {
-    cli::cli_alert_info("  Querying IEDB for term: {.val {term}}")
+  # Safe column extractor
+  safe_col <- function(df, col) {
+    if (col %in% names(df)) df[[col]] else NA_character_
+  }
 
+  # -- 2a. Search epitope_search for modification descriptions ----------------
+  fetch_epitopes_for_term <- function(term) {
+    cli::cli_alert_info("  Querying IEDB epitope_search for: {.val {term}}")
+
+    # PostgREST syntax: use `or` to search both modification and description
+    # fields, with `like` operator for pattern matching
     resp <- tryCatch(
       {
-        httr2::request(.IEDB_REST) |>
+        httr2::request(.IEDB_EPITOPE) |>
           httr2::req_url_query(
-            epitope_structure_type = "Linear peptide",
-            source_organism_id    = "9606",         # Homo sapiens
-            host_organism_id      = "9606",
-            epitope_modification  = term,
-            response_type         = "B cell",
-            output_format         = "json"
+            structure_type = "eq.Linear peptide",
+            `or`           = paste0(
+              "(e_modification.ilike.*", term, "*,",
+              "structure_descriptions.ilike.*", term, "*)"
+            ),
+            source_organism_iri_search = 'cs.{"NCBITaxon:9606"}',
+            bcell_ids      = "not.is.null",
+            limit          = 10000,
+            order          = "structure_iri",
+            select         = paste0(
+              "structure_id,linear_sequence,structure_descriptions,",
+              "e_modification,source_organism_names,source_antigen_accession,",
+              "curated_source_antigens,qualitative_measures,pubmed_ids"
+            )
           ) |>
+          httr2::req_headers(Accept = "application/json") |>
           httr2::req_timeout(120) |>
           httr2::req_retry(max_tries = 3, backoff = ~ 3) |>
           httr2::req_perform()
       },
       error = function(e) {
-        cli::cli_warn("IEDB query failed for {.val {term}}: {conditionMessage(e)}")
+        cli::cli_warn("IEDB epitope_search failed for {.val {term}}: {conditionMessage(e)}")
         return(NULL)
       }
     )
@@ -351,71 +373,217 @@ fetch_iedb_modified_epitopes <- function(cache = NULL) {
     )
 
     if (is.null(body) || length(body) == 0) return(tibble::tibble())
-
-    # Normalise to tibble
     tbl <- tryCatch(tibble::as_tibble(body), error = function(e) tibble::tibble())
     if (nrow(tbl) == 0) return(tibble::tibble())
 
-    # Extract relevant fields defensively
-    safe_col <- function(df, col) {
-      if (col %in% names(df)) df[[col]] else NA_character_
+    # Extract UniProt accession from source_antigen_accession or
+    # curated_source_antigens (which may contain UniProt IRIs)
+    extract_uniprot <- function(acc_field, curated_field) {
+      # Try direct accession column first
+      if (!is.na(acc_field) && nchar(acc_field) > 0) {
+        up <- stringr::str_extract(acc_field, "[A-Z][A-Z0-9]{4,9}")
+        if (!is.na(up)) return(up)
+      }
+      # Try curated source antigens for UniProt IRI
+      if (!is.na(curated_field) && nchar(curated_field) > 0) {
+        up <- stringr::str_extract(curated_field, "(?<=uniprot/)[A-Z][A-Z0-9]{4,9}")
+        if (!is.na(up)) return(up)
+        up <- stringr::str_extract(curated_field, "[A-Z][A-Z0-9]{4,9}")
+        if (!is.na(up)) return(up)
+      }
+      NA_character_
     }
 
     tibble::tibble(
-      EpitopeID         = safe_col(tbl, "epitope_id"),
-      Sequence          = safe_col(tbl, "linear_sequence"),
-      Description       = safe_col(tbl, "description"),
-      UniProtID         = safe_col(tbl, "source_antigen_accession"),
-      AssayType         = safe_col(tbl, "assay_type"),
-      AntibodyIsotype   = safe_col(tbl, "isotype"),
-      PubMedIDs         = safe_col(tbl, "pubmed_id"),
-      Qualitative       = safe_col(tbl, "qualitative_measure"),
-      SearchTerm        = term
-    )
-  }
-
-  all_epitopes <- if (!is.null(cache)) {
-    cache_get_or_set(cache, "iedb_modified_epitopes", function() {
-      purrr::map(mod_terms, fetch_for_term) |> dplyr::bind_rows()
-    })
-  } else {
-    purrr::map(mod_terms, fetch_for_term) |> dplyr::bind_rows()
-  }
-
-  if (nrow(all_epitopes) == 0) {
-    cli::cli_warn("No IEDB epitopes returned; returning empty tibble.")
-    return(tibble::tibble(
-      EpitopeID = character(), Sequence = character(),
-      ModifiedPositions = character(), UniProtID = character(),
-      AssayType = character(), AntibodyIsotype = character(),
-      PubMedIDs = character(), HighConfidenceIgG = logical()
-    ))
-  }
-
-  # Deduplicate
-  all_epitopes <- all_epitopes |> dplyr::distinct(EpitopeID, .keep_all = TRUE)
-
-  # Flag high-confidence IgG positives
-  all_epitopes <- all_epitopes |>
-    dplyr::mutate(
-      HighConfidenceIgG = stringr::str_detect(
-        AntibodyIsotype, stringr::regex("IgG", ignore_case = TRUE)
-      ) & stringr::str_detect(
-        Qualitative, stringr::regex("Positive", ignore_case = TRUE)
+      EpitopeID   = as.character(safe_col(tbl, "structure_id")),
+      Sequence    = safe_col(tbl, "linear_sequence"),
+      Description = safe_col(tbl, "structure_descriptions"),
+      Modification = safe_col(tbl, "e_modification"),
+      UniProtID   = purrr::map2_chr(
+        dplyr::coalesce(safe_col(tbl, "source_antigen_accession"), ""),
+        dplyr::coalesce(safe_col(tbl, "curated_source_antigens"), ""),
+        extract_uniprot
       ),
-      HighConfidenceIgG = dplyr::coalesce(HighConfidenceIgG, FALSE),
-      # Attempt to parse modification positions from description
-      ModifiedPositions = stringr::str_extract_all(
-        Description,
-        "\\d+"
-      ) |> purrr::map_chr(~ paste(.x, collapse = ","))
+      Qualitative = safe_col(tbl, "qualitative_measures"),
+      PubMedIDs   = safe_col(tbl, "pubmed_ids"),
+      SearchTerm  = term
+    )
+  }
+
+  # -- 2b. Search bcell_search for assay-level detail -------------------------
+  fetch_bcell_for_term <- function(term) {
+    cli::cli_alert_info("  Querying IEDB bcell_search for: {.val {term}}")
+
+    resp <- tryCatch(
+      {
+        httr2::request(.IEDB_BCELL) |>
+          httr2::req_url_query(
+            structure_type = "eq.Linear peptide",
+            `or`           = paste0(
+              "(e_modification.ilike.*", term, "*,",
+              "structure_descriptions.ilike.*", term, "*)"
+            ),
+            source_organism_iri = "eq.NCBITaxon:9606",
+            host_organism_iri   = "eq.NCBITaxon:9606",
+            limit               = 5000,
+            order               = "structure_iri",
+            select              = paste0(
+              "structure_id,linear_sequence,structure_descriptions,",
+              "e_modification,qualitative_measure,assay_type,isotype,",
+              "pubmed_id,source_antigen_accession"
+            )
+          ) |>
+          httr2::req_headers(Accept = "application/json") |>
+          httr2::req_timeout(120) |>
+          httr2::req_retry(max_tries = 3, backoff = ~ 3) |>
+          httr2::req_perform()
+      },
+      error = function(e) {
+        cli::cli_warn("IEDB bcell_search failed for {.val {term}}: {conditionMessage(e)}")
+        return(NULL)
+      }
     )
 
-  result <- all_epitopes |>
-    dplyr::select(
-      EpitopeID, Sequence, ModifiedPositions, UniProtID,
-      AssayType, AntibodyIsotype, PubMedIDs, HighConfidenceIgG
+    if (is.null(resp)) return(tibble::tibble())
+
+    body <- tryCatch(
+      httr2::resp_body_json(resp, simplifyVector = TRUE),
+      error = function(e) NULL
     )
+
+    if (is.null(body) || length(body) == 0) return(tibble::tibble())
+    tbl <- tryCatch(tibble::as_tibble(body), error = function(e) tibble::tibble())
+    if (nrow(tbl) == 0) return(tibble::tibble())
+
+    tibble::tibble(
+      EpitopeID       = as.character(safe_col(tbl, "structure_id")),
+      Sequence        = safe_col(tbl, "linear_sequence"),
+      AssayType       = safe_col(tbl, "assay_type"),
+      AntibodyIsotype = safe_col(tbl, "isotype"),
+      Qualitative_BC  = safe_col(tbl, "qualitative_measure"),
+      SearchTerm      = term
+    )
+  }
+
+  # -- 2c. Execute all queries ------------------------------------------------
+  do_iedb_fetch <- function() {
+    ep_results <- purrr::map(mod_terms, fetch_epitopes_for_term) |>
+      dplyr::bind_rows()
+    bc_results <- purrr::map(mod_terms, fetch_bcell_for_term) |>
+      dplyr::bind_rows()
+    list(epitopes = ep_results, bcells = bc_results)
+  }
+
+  raw <- if (!is.null(cache)) {
+    cache_get_or_set(cache, "iedb_modified_epitopes_v2", do_iedb_fetch)
+  } else {
+    do_iedb_fetch()
+  }
+
+  ep_data <- raw$epitopes
+  bc_data <- raw$bcells
+
+  # -- 2d. Merge epitope-level and B-cell assay-level data --------------------
+  empty_result <- tibble::tibble(
+    EpitopeID = character(), Sequence = character(),
+    ModifiedPositions = character(), UniProtID = character(),
+    AssayType = character(), AntibodyIsotype = character(),
+    PubMedIDs = character(), HighConfidenceIgG = logical()
+  )
+
+  if (nrow(ep_data) == 0 && nrow(bc_data) == 0) {
+    cli::cli_warn("No IEDB epitopes returned; returning empty tibble.")
+    return(empty_result)
+  }
+
+  # Deduplicate epitope-level hits
+  if (nrow(ep_data) > 0) {
+    ep_data <- ep_data |> dplyr::distinct(EpitopeID, .keep_all = TRUE)
+  }
+
+  # Summarise B-cell assay detail per epitope
+  bc_summary <- tibble::tibble()
+  if (nrow(bc_data) > 0) {
+    bc_summary <- bc_data |>
+      dplyr::group_by(EpitopeID) |>
+      dplyr::summarise(
+        AssayType       = paste(unique(stats::na.omit(AssayType)), collapse = "; "),
+        AntibodyIsotype = paste(unique(stats::na.omit(AntibodyIsotype)), collapse = "; "),
+        .has_igg_pos    = any(
+          stringr::str_detect(
+            dplyr::coalesce(AntibodyIsotype, ""),
+            stringr::regex("IgG", ignore_case = TRUE)
+          ) &
+          stringr::str_detect(
+            dplyr::coalesce(Qualitative_BC, ""),
+            stringr::regex("Positive", ignore_case = TRUE)
+          ),
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+  }
+
+  # Build final table
+  if (nrow(ep_data) > 0) {
+    all_epitopes <- ep_data
+
+    # Join B-cell assay summary if available
+    if (nrow(bc_summary) > 0) {
+      all_epitopes <- all_epitopes |>
+        dplyr::left_join(bc_summary, by = "EpitopeID")
+    } else {
+      all_epitopes <- all_epitopes |>
+        dplyr::mutate(
+          AssayType = NA_character_,
+          AntibodyIsotype = NA_character_,
+          .has_igg_pos = FALSE
+        )
+    }
+
+    # Flag high-confidence IgG positives
+    all_epitopes <- all_epitopes |>
+      dplyr::mutate(
+        HighConfidenceIgG = dplyr::coalesce(.has_igg_pos, FALSE) |
+          stringr::str_detect(
+            dplyr::coalesce(Qualitative, ""),
+            stringr::regex("Positive", ignore_case = TRUE)
+          ),
+        HighConfidenceIgG = dplyr::coalesce(HighConfidenceIgG, FALSE),
+        # Parse modification positions from description
+        ModifiedPositions = stringr::str_extract_all(
+          dplyr::coalesce(Description, ""),
+          "\\d+"
+        ) |> purrr::map_chr(~ paste(.x, collapse = ","))
+      )
+
+    result <- all_epitopes |>
+      dplyr::select(
+        EpitopeID, Sequence, ModifiedPositions, UniProtID,
+        AssayType, AntibodyIsotype, PubMedIDs, HighConfidenceIgG
+      )
+  } else {
+    # Only have B-cell data, no epitope-level data
+    result <- bc_data |>
+      dplyr::distinct(EpitopeID, .keep_all = TRUE) |>
+      dplyr::mutate(
+        ModifiedPositions = NA_character_,
+        UniProtID = NA_character_,
+        PubMedIDs = NA_character_,
+        HighConfidenceIgG = stringr::str_detect(
+          dplyr::coalesce(AntibodyIsotype, ""),
+          stringr::regex("IgG", ignore_case = TRUE)
+        ) & stringr::str_detect(
+          dplyr::coalesce(Qualitative_BC, ""),
+          stringr::regex("Positive", ignore_case = TRUE)
+        ),
+        HighConfidenceIgG = dplyr::coalesce(HighConfidenceIgG, FALSE)
+      ) |>
+      dplyr::select(
+        EpitopeID, Sequence, ModifiedPositions, UniProtID,
+        AssayType, AntibodyIsotype, PubMedIDs, HighConfidenceIgG
+      )
+  }
 
   cli::cli_alert_success("IEDB: {nrow(result)} modified epitopes retrieved")
   result
@@ -508,33 +676,28 @@ fetch_ptm_sites <- function(uniprot_ids, ptm_file = NULL, cache = NULL) {
 
   cli::cli_alert_info("Fetching PTM features from UniProt for {length(uniprot_ids)} proteins ...")
 
-  # Process with progress bar
+  # Fetch all PTMs (progress counter via cli_alert_info to avoid closure issues)
+  fetch_all_ptms <- function() {
+    n_total <- length(uniprot_ids)
+    results <- vector("list", n_total)
+    for (i in seq_along(uniprot_ids)) {
+      if (i %% 10 == 1 || i == n_total) {
+        cli::cli_alert_info("  UniProt PTM fetch: {i}/{n_total}")
+      }
+      results[[i]] <- fetch_uniprot_ptms(uniprot_ids[[i]])
+      Sys.sleep(0.15)
+    }
+    dplyr::bind_rows(results)
+  }
+
   ptm_uniprot <- if (!is.null(cache)) {
     cache_get_or_set(
       cache,
       paste0("uniprot_ptms_", digest::digest(sort(uniprot_ids))),
-      function() {
-        cli::cli_progress_bar("UniProt PTMs", total = length(uniprot_ids))
-        results <- purrr::map(uniprot_ids, function(acc) {
-          res <- fetch_uniprot_ptms(acc)
-          cli::cli_progress_update()
-          Sys.sleep(0.15)
-          res
-        })
-        cli::cli_progress_done()
-        dplyr::bind_rows(results)
-      }
+      fetch_all_ptms
     )
   } else {
-    cli::cli_progress_bar("UniProt PTMs", total = length(uniprot_ids))
-    results <- purrr::map(uniprot_ids, function(acc) {
-      res <- fetch_uniprot_ptms(acc)
-      cli::cli_progress_update()
-      Sys.sleep(0.15)
-      res
-    })
-    cli::cli_progress_done()
-    dplyr::bind_rows(results)
+    fetch_all_ptms()
   }
 
   # -- 3b. PhosphoSitePlus bulk file (optional) --------------------------------
@@ -1277,12 +1440,182 @@ chemscan_pipeline <- function(chemicals  = NULL,
 }
 
 ###############################################################################
+# POSITIVE CONTROL: validate with well-characterised modified proteins
+###############################################################################
+
+#' Run a positive-control validation using well-characterised chemically
+#' modified proteins (citrullinated vimentin, acetylated histone H4, and
+#' cisplatin-crosslinked HMGB1). These proteins have extensive literature
+#' support for chemical modifications and confirmed immune epitopes.
+#'
+#' This function bypasses CTD and IEDB queries and feeds known UniProt IDs
+#' directly into Modules 3-5, verifying that PTM retrieval, tiling, and
+#' scoring produce non-trivial output.
+#'
+#' @param output_dir Directory for outputs. Default "chemscan_posctrl".
+#' @return A tibble of scored peptides (invisibly). Prints a diagnostic
+#'   summary to the console.
+chemscan_positive_control <- function(output_dir = "chemscan_posctrl") {
+
+  cli::cli_h1("ChemScan Positive Control")
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  cache <- init_cache(file.path(output_dir, "cache"))
+
+  # Well-characterised positive-control proteins
+  # P08670: Vimentin — citrullinated in RA, confirmed CCP/ACPA epitopes
+  # P62805: Histone H4 — heavily acetylated, autoantibodies in SLE
+  # P09429: HMGB1 — cisplatin crosslink target, acetylation-dependent release
+  pos_ctrl_proteins <- c("P08670", "P62805", "P09429")
+  pos_ctrl_names    <- c("Vimentin", "Histone H4", "HMGB1")
+
+  # Synthetic CTD-like data for scoring context
+  ctd_synthetic <- tibble::tibble(
+    ChemicalName    = c("Citrulline (via PAD)", "Acetyl-CoA", "Cisplatin"),
+    CAS_RN          = c(NA_character_, "72-89-9", "15663-27-1"),
+    GeneSymbol      = c("VIM", "HIST1H4A", "HMGB1"),
+    UniProtID       = pos_ctrl_proteins,
+    InteractionType = c("modification", "modification", "binding|crosslink"),
+    PubMedIDs       = c("11279042|17344846|20080530",
+                        "10318839|15044459|22266854",
+                        "12888564|19377508|20530531|23542145|25686030")
+  )
+
+  # Synthetic IEDB-like data for scoring context
+  iedb_synthetic <- tibble::tibble(
+    EpitopeID         = as.character(1:3),
+    Sequence          = c("RLRSSVPGVRLLQD",   # Vimentin 60-73 (CCP epitope)
+                          "SGRGKGGKGLGKGG",   # Histone H4 N-term
+                          "KGDPKKPRGKMSSYA"),  # HMGB1 A-box
+    ModifiedPositions = c("4", "5,9,13", "12"),
+    UniProtID         = pos_ctrl_proteins,
+    AssayType         = rep("ELISA", 3),
+    AntibodyIsotype   = rep("IgG", 3),
+    PubMedIDs         = c("11279042", "15044459", "19377508"),
+    HighConfidenceIgG = c(TRUE, TRUE, TRUE)
+  )
+
+  cli::cli_alert_info(
+    "Positive control proteins: {paste(pos_ctrl_names, collapse = ', ')}"
+  )
+
+  # Module 3: PTM sites
+  cli::cli_rule()
+  ptm_sites <- fetch_ptm_sites(
+    uniprot_ids = pos_ctrl_proteins,
+    cache       = cache
+  )
+  readr::write_tsv(ptm_sites, file.path(output_dir, "posctrl_ptm_sites.tsv"))
+
+  n_ptm <- nrow(ptm_sites)
+  cli::cli_alert_info("PTM sites retrieved: {n_ptm}")
+
+  if (n_ptm == 0) {
+    cli::cli_alert_warning(
+      "VALIDATION ISSUE: No PTM sites found for positive-control proteins. ",
+      "Check network connectivity to UniProt."
+    )
+    return(invisible(tibble::tibble()))
+  }
+
+  # Module 4: Tiling (all three are high-priority)
+  cli::cli_rule()
+  peptides <- tile_peptides(
+    uniprot_ids   = pos_ctrl_proteins,
+    ptm_sites     = ptm_sites,
+    high_priority = pos_ctrl_proteins,
+    cache         = cache
+  )
+  readr::write_tsv(peptides, file.path(output_dir, "posctrl_peptides.tsv"))
+
+  if (nrow(peptides) == 0) {
+    cli::cli_alert_warning("VALIDATION ISSUE: No peptide tiles generated.")
+    return(invisible(tibble::tibble()))
+  }
+
+  # Module 5: Scoring
+  cli::cli_rule()
+  scored <- score_peptides(
+    peptides  = peptides,
+    iedb_data = iedb_synthetic,
+    ctd_data  = ctd_synthetic,
+    cache     = cache
+  )
+  readr::write_tsv(scored, file.path(output_dir, "posctrl_scored.tsv"))
+
+  # Diagnostic summary
+  cli::cli_rule()
+  cli::cli_h2("Positive Control Summary")
+
+  for (i in seq_along(pos_ctrl_proteins)) {
+    acc <- pos_ctrl_proteins[i]
+    nm  <- pos_ctrl_names[i]
+    sub <- scored |> dplyr::filter(UniProtID == acc)
+    n_pep <- nrow(sub)
+    n_ptm_pep <- sub |> dplyr::filter(!is.na(ModType)) |> nrow()
+    top_score <- if (n_pep > 0) round(max(sub$CompositeScore, na.rm = TRUE), 4) else 0
+
+    cli::cli_alert_success(
+      "{nm} ({acc}): {n_pep} tiles, {n_ptm_pep} with PTM, top score = {top_score}"
+    )
+  }
+
+  n_total <- nrow(scored)
+  n_with_mod <- scored |> dplyr::filter(!is.na(ModType)) |> nrow()
+  score_range <- range(scored$CompositeScore, na.rm = TRUE)
+
+  cli::cli_h3("Overall")
+  cli::cli_alert_info("Total peptides: {n_total}")
+  cli::cli_alert_info("Peptides with PTM: {n_with_mod}")
+  cli::cli_alert_info(
+    "Score range: [{round(score_range[1], 4)}, {round(score_range[2], 4)}]"
+  )
+
+  # Validation checks
+  checks_passed <- TRUE
+  if (n_total == 0) {
+    cli::cli_alert_danger("FAIL: No peptides generated")
+    checks_passed <- FALSE
+  }
+  if (n_with_mod == 0) {
+    cli::cli_alert_danger("FAIL: No PTM-centred peptides found")
+    checks_passed <- FALSE
+  }
+  if (all(scored$CompositeScore == 0, na.rm = TRUE)) {
+    cli::cli_alert_danger("FAIL: All composite scores are zero")
+    checks_passed <- FALSE
+  }
+
+  all_62 <- all(nchar(scored$PeptideSequence) == .TILE_LENGTH)
+  if (!all_62) {
+    cli::cli_alert_danger(
+      "FAIL: Not all peptides are {.TILE_LENGTH}-mers"
+    )
+    checks_passed <- FALSE
+  } else {
+    cli::cli_alert_success("PASS: All peptides are {.TILE_LENGTH}-mers")
+  }
+
+  if (checks_passed) {
+    cli::cli_alert_success("All positive control checks PASSED")
+  } else {
+    cli::cli_alert_warning("Some positive control checks FAILED - see above")
+  }
+
+  cli::cli_alert_info("Outputs written to {.file {output_dir}}")
+  invisible(scored)
+}
+
+###############################################################################
 # WORKED EXAMPLE (commented)
 ###############################################################################
 
-# library(chemscan)  # or source("chemscan_pipeline.R")
+# source("chemscan_pipeline.R")
 #
-# # Run the ChemScan pipeline for three test chemicals
+# # --- Quick validation with positive controls ---
+# posctrl <- chemscan_positive_control(output_dir = "chemscan_posctrl")
+#
+# # --- Full pipeline for three test chemicals ---
 # results <- chemscan_pipeline(
 #   chemicals  = c("acrylamide", "benzene", "cisplatin"),
 #   proteins   = NULL,
